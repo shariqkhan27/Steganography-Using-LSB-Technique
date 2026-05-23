@@ -655,40 +655,51 @@ class SteganographyApp:
             return
         
         try:
+            # Ask where to save BEFORE encoding starts
+            output_path = filedialog.asksaveasfilename(
+                title="Save Encoded Image As",
+                defaultextension=".png",
+                filetypes=[("PNG files", "*.png"), ("All files", "*.*")],
+                initialfile="stego_output.png"
+            )
+            if not output_path:
+                self.status_var.set("Encoding cancelled.")
+                return  # User hit Cancel
+
             self.progress_var.set(30)
             self.status_var.set("Encoding message...")
             self.window.update()
-            
-            # Generate output path
-            output_path = f"stego_image_output.png"
-            
-            # Encode
+
+            # Encode directly to the chosen path
             stats = self.encoder.encode(
                 self.carrier_image,
                 message,
                 password,
                 output_path
             )
-            
+
             self.progress_var.set(100)
-            
-            # Update UI
-            self.stego_image = output_path
-            self.display_image(output_path, self.output_preview)
-            
+
+            # Update UI - encoder may have appended .png
+            self.stego_image = stats['output_path']
+            self.display_image(self.stego_image, self.output_preview)
+
             # Show statistics
             self.stats_text.delete(1.0, tk.END)
-            self.stats_text.insert(tk.END, "╔════════════════════════════════╗\n")
-            self.stats_text.insert(tk.END, "║   ✅ ENCODING SUCCESSFUL!     ║\n")
-            self.stats_text.insert(tk.END, "╚════════════════════════════════╝\n\n")
-            self.stats_text.insert(tk.END, f"📝 Message Length: {stats['message_length']} characters\n")
-            self.stats_text.insert(tk.END, f"📦 Payload Size: {stats['payload_size']} bytes\n")
-            self.stats_text.insert(tk.END, f"💾 Capacity Used: {stats['capacity_used']}\n")
-            self.stats_text.insert(tk.END, f"🔢 Bits Embedded: {stats['bits_embedded']}\n")
-            self.stats_text.insert(tk.END, f"📁 Output File: {stats['output_path']}\n")
-            
-            self.status_var.set("Message encoded successfully!")
-            messagebox.showinfo("Success", "Message encoded successfully!")
+            self.stats_text.insert(tk.END, "\u2554" + "\u2550"*32 + "\u2557\n")
+            self.stats_text.insert(tk.END, "\u2551   \u2705 ENCODING SUCCESSFUL!     \u2551\n")
+            self.stats_text.insert(tk.END, "\u255a" + "\u2550"*32 + "\u255d\n\n")
+            self.stats_text.insert(tk.END, f"\U0001f4dd Message Length: {stats['message_length']} characters\n")
+            self.stats_text.insert(tk.END, f"\U0001f4e6 Payload Size: {stats['payload_size']} bytes\n")
+            self.stats_text.insert(tk.END, f"\U0001f4be Capacity Used: {stats['capacity_used']}\n")
+            self.stats_text.insert(tk.END, f"\U0001f522 Bits Embedded: {stats['bits_embedded']}\n")
+            self.stats_text.insert(tk.END, f"\U0001f4c1 Saved to: {stats['output_path']}\n")
+
+            self.status_var.set(f"\u2705 Saved to: {stats['output_path']}")
+            messagebox.showinfo(
+                "Success",
+                f"Message encoded and saved!\n\n\U0001f4c1 {stats['output_path']}"
+            )
             
         except Exception as e:
             messagebox.showerror("Encoding Error", str(e))
@@ -696,16 +707,16 @@ class SteganographyApp:
             self.status_var.set(f"Error: {str(e)}")
     
     def decode_message(self):
-        """Handle message decoding"""
+        """Handle message decoding with self-destruct awareness"""
         if not self.stego_image:
             messagebox.showerror("Error", "Please select a stego image")
             return
-    
+
         password = self.decode_password_var.get()
         if not password:
             messagebox.showerror("Error", "Please enter the decryption password")
             return
-    
+
         try:
             self.status_var.set("Decoding message...")
             self.window.update()
@@ -716,34 +727,78 @@ class SteganographyApp:
 
             # Decode
             result = self.decoder.decode(self.stego_image, password)
-        
+
             if result['success']:
-                # Display the extracted message
+                # ── Success ──────────────────────────────────────────────
+                self.extracted_message.configure(fg='#00ff00')
                 self.extracted_message.insert(1.0, result['message'])
-            
-                # Show metadata if available
+
                 if result.get('metadata') and len(result['metadata']) > 0:
                     import json
                     self.metadata_text.insert(1.0, json.dumps(result['metadata'], indent=2))
                 else:
                     self.metadata_text.insert(1.0, "No metadata found in this image")
-            
+
                 self.status_var.set("✅ Message decoded successfully!")
-                messagebox.showinfo("Success", f"Message extracted successfully!\n\nLength: {len(result['message'])} characters")
+                messagebox.showinfo(
+                    "Success",
+                    f"Message extracted successfully!\n\nLength: {len(result['message'])} characters"
+                )
+
             else:
-                # Show error message
                 error_msg = result.get('error', 'Unknown error')
-                self.extracted_message.insert(1.0, f"❌ ERROR: {error_msg}")
-                self.metadata_text.insert(1.0, "Decoding failed - see error message")
-                self.status_var.set("❌ Decoding failed")
-                messagebox.showerror("Decoding Error", error_msg)
-            
+
+                if result.get('destroyed'):
+                    # ── Self-destruct just fired ──────────────────────────
+                    self._show_destruct_ui(error_msg)
+                elif '🔥 SELF-DESTRUCT' in error_msg or 'permanently destroyed' in error_msg:
+                    # ── Already poisoned (previous attempt) ──────────────
+                    self._show_destruct_ui(error_msg)
+                else:
+                    # ── Generic error ─────────────────────────────────────
+                    self.extracted_message.configure(fg='#ff4444')
+                    self.extracted_message.insert(1.0, f"❌ ERROR:\n\n{error_msg}")
+                    self.metadata_text.insert(1.0, "Decoding failed — see error message")
+                    self.status_var.set("❌ Decoding failed")
+                    messagebox.showerror("Decoding Error", error_msg)
+
         except Exception as e:
             import traceback
-            error_detail = traceback.format_exc()
-            print(error_detail)
+            traceback.print_exc()
             messagebox.showerror("Error", f"An unexpected error occurred:\n\n{str(e)}")
             self.status_var.set("Error during decoding")
+
+    def _show_destruct_ui(self, error_msg: str):
+        """Flash the UI red and show the self-destruct warning."""
+        # Turn message area red with warning text
+        self.extracted_message.configure(fg='#ff2222', bg='#1a0000')
+        self.extracted_message.delete(1.0, tk.END)
+        self.extracted_message.insert(
+            1.0,
+            "💀 MESSAGE PERMANENTLY DESTROYED 💀\n\n"
+            "The hidden data has been overwritten with\n"
+            "random noise and cannot be recovered.\n\n"
+            "This image is now a clean carrier."
+        )
+        self.metadata_text.delete(1.0, tk.END)
+        self.metadata_text.insert(1.0, "⚠️  Self-destruct was triggered by a wrong password.\n"
+                                        "All payload data has been erased from this image.")
+        self.status_var.set("💀 SELF-DESTRUCT TRIGGERED — data permanently erased")
+
+        # Flash window title briefly
+        original_title = self.window.title()
+        self.window.title("🔥 SELF-DESTRUCT TRIGGERED — DATA DESTROYED")
+        self.window.configure(bg='#3a0000')
+        self.window.after(3000, lambda: self.window.title(original_title))
+        self.window.after(3000, lambda: self.window.configure(bg='#2b2b2b'))
+
+        messagebox.showerror(
+            "🔥 SELF-DESTRUCT ACTIVATED",
+            "WRONG PASSWORD DETECTED\n\n"
+            "The hidden message has been permanently erased.\n"
+            "The image LSBs have been overwritten with random noise.\n\n"
+            "No further recovery is possible."
+        )
     
     def save_stego_image(self):
         """Save stego image to chosen location"""
@@ -796,34 +851,43 @@ class SteganographyApp:
                 messagebox.showerror("Error", str(e))
     
     def detect_hidden_data(self):
-        """Detect if image contains hidden data"""
+        """Detect if image contains hidden data (and whether it has been destroyed)"""
         filepath = filedialog.askopenfilename(
             title="Select Image for Detection",
             filetypes=[("Image files", "*.png *.jpg *.jpeg *.bmp")]
         )
-        
+
         if filepath:
             try:
                 self.status_var.set("Scanning for hidden data...")
                 self.window.update()
-                
-                has_data = self.decoder.detect_hidden_data(filepath)
-                
+
+                detection = self.decoder.detect_hidden_data(filepath)
+
                 self.analysis_text.delete(1.0, tk.END)
                 self.analysis_text.insert(tk.END, "╔══════════════════════════════════╗\n")
                 self.analysis_text.insert(tk.END, "║  STEGANALYSIS DETECTION         ║\n")
                 self.analysis_text.insert(tk.END, "╚══════════════════════════════════╝\n\n")
-                
-                if has_data:
-                    self.analysis_text.insert(tk.END, "⚠️  HIDDEN DATA DETECTED!\n\n")
-                    self.analysis_text.insert(tk.END, "The image likely contains steganographic content.\n")
-                    self.analysis_text.insert(tk.END, "Magic number 'STEG' found in LSB data.\n")
-                    self.status_var.set("⚠️ Hidden data detected!")
+                self.analysis_text.insert(tk.END, f"File: {os.path.basename(filepath)}\n\n")
+
+                if detection['poisoned']:
+                    self.analysis_text.insert(tk.END, "💀 SELF-DESTRUCT WAS TRIGGERED\n\n")
+                    self.analysis_text.insert(tk.END, detection['message'] + "\n")
+                    self.analysis_text.insert(tk.END, "\nThe image once contained hidden data,\n")
+                    self.analysis_text.insert(tk.END, "but a wrong password destroyed it.\n")
+                    self.status_var.set("💀 Destroyed steganographic data found")
+                elif detection['found']:
+                    self.analysis_text.insert(tk.END, "⚠️  ACTIVE HIDDEN DATA DETECTED!\n\n")
+                    self.analysis_text.insert(tk.END, detection['message'] + "\n")
+                    self.analysis_text.insert(tk.END, "\nIntegrity flag: ALIVE ✅\n")
+                    self.analysis_text.insert(tk.END, "Magic number 'STEG' confirmed in LSB data.\n")
+                    self.status_var.set("⚠️ Active hidden data detected!")
                 else:
                     self.analysis_text.insert(tk.END, "✅ NO HIDDEN DATA DETECTED\n\n")
-                    self.analysis_text.insert(tk.END, "The image appears to be clean.\n")
+                    self.analysis_text.insert(tk.END, detection['message'] + "\n")
+                    self.analysis_text.insert(tk.END, "\nThe image appears to be a clean carrier.\n")
                     self.status_var.set("No hidden data found")
-                    
+
             except Exception as e:
                 messagebox.showerror("Error", str(e))
     

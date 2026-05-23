@@ -1,328 +1,303 @@
 """
 Advanced Steganography Decoder Module
-Extracts and decrypts hidden messages from images
-Completely reworked for reliability
+Extracts and decrypts hidden messages from images.
+Self-destruct: one wrong password attempt overwrites all payload LSBs
+with random noise and marks the image as poisoned.
 """
 
 from PIL import Image
 import numpy as np
 import struct
+import os
 from security import SecurityLayer
 from utils import SteganographyUtils
 
+# Must match constants in encoder.py
+FLAG_ALIVE    = 0b10101010   # 0xAA
+FLAG_POISONED = 0b11111111   # 0xFF
+
+
 class SteganographyDecoder:
     """
-    Advanced decoder for extracting hidden messages
+    Advanced decoder with self-destruct capability.
     """
-    
+
     def __init__(self):
         self.security = SecurityLayer()
-        self.utils = SteganographyUtils()
-    
+        self.utils    = SteganographyUtils()
+
+    # ------------------------------------------------------------------ #
+    #  Flag helpers (mirrors encoder)                                      #
+    # ------------------------------------------------------------------ #
+
+    def _read_flag(self, img_array: np.ndarray) -> int:
+        height, width, _ = img_array.shape
+        total_pixels = height * width
+        bits = []
+        for idx in range(total_pixels - 8, total_pixels):
+            y, x = divmod(idx, width)
+            bits.append(int(img_array[y, x, 0]) & 1)
+        value = 0
+        for b in bits:
+            value = (value << 1) | b
+        return value
+
+    def _write_flag(self, img_array: np.ndarray, flag_byte: int) -> np.ndarray:
+        arr = img_array.copy()
+        height, width, _ = arr.shape
+        total_pixels = height * width
+        bits = [(flag_byte >> (7 - i)) & 1 for i in range(8)]
+        for i, idx in enumerate(range(total_pixels - 8, total_pixels)):
+            y, x = divmod(idx, width)
+            v = (int(arr[y, x, 0]) & 0xFE) | bits[i]
+            arr[y, x, 0] = np.uint8(v)
+        return arr
+
+    # ------------------------------------------------------------------ #
+    #  Self-destruct                                                       #
+    # ------------------------------------------------------------------ #
+
+    def _destroy_payload(self, image_path: str, img_array: np.ndarray) -> None:
+        """
+        Overwrite every payload LSB with random noise and set the POISONED
+        flag, then save the image back in place.
+        """
+        print("⚠️  Self-destruct triggered: overwriting payload LSBs with noise...")
+
+        height, width, channels = img_array.shape
+        destroyed = img_array.copy()
+        flag_pixel_start = (height * width) - 8
+
+        # Generate random bits for the entire payload zone
+        pixel_counter = 0
+        for y in range(height):
+            for x in range(width):
+                if pixel_counter >= flag_pixel_start:
+                    break
+                for c in range(channels):
+                    noise_bit = int(np.random.randint(0, 2))
+                    v = (int(destroyed[y, x, c]) & 0xFE) | noise_bit
+                    destroyed[y, x, c] = np.uint8(v)
+                pixel_counter += 1
+            if pixel_counter >= flag_pixel_start:
+                break
+
+        # Write POISONED flag
+        destroyed = self._write_flag(destroyed, FLAG_POISONED)
+
+        # Save back to the same path (overwrite)
+        Image.fromarray(destroyed, mode='RGB').save(image_path, 'PNG', optimize=False)
+        print("💀 Image payload destroyed. File saved back.")
+
+    # ------------------------------------------------------------------ #
+    #  Public decode                                                       #
+    # ------------------------------------------------------------------ #
+
     def decode(self, image_path: str, password: str) -> dict:
         """
-        Extract and decrypt message from stego image
-        
-        Args:
-            image_path: Path to stego image
-            password: Password for decryption
-            
-        Returns:
-            Dictionary with extracted message and metadata
+        Extract and decrypt message from stego image.
+
+        Self-destruct logic:
+          - If flag == POISONED  → reject immediately (already destroyed).
+          - If flag == ALIVE     → attempt decryption.
+              • Success          → return message normally.
+              • Wrong password   → destroy payload, return error.
         """
         try:
-            # Load image
             img = Image.open(image_path)
-            
-            # Convert to RGB if necessary
             if img.mode not in ['RGB', 'RGBA']:
                 img = img.convert('RGB')
             if img.mode == 'RGBA':
                 img = img.convert('RGB')
-            
-            # Convert to numpy array
+
             img_array = np.array(img, dtype=np.uint8)
             height, width, channels = img_array.shape
-            
+
             print(f"Image loaded: {width}x{height}, {channels} channels")
-            
-            # First, extract all LSBs from the entire image
+
+            # ── 1. Check self-destruct flag ──────────────────────────────
+            flag = self._read_flag(img_array)
+            print(f"Integrity flag: {bin(flag)} ({flag})")
+
+            if flag == FLAG_POISONED:
+                return {
+                    'success': False,
+                    'error':   (
+                        '🔥 SELF-DESTRUCT TRIGGERED\n'
+                        'A previous wrong password attempt has permanently destroyed '
+                        'the hidden data in this image. The message cannot be recovered.'
+                    )
+                }
+
+            if flag != FLAG_ALIVE:
+                return {
+                    'success': False,
+                    'error':   'No steganographic data found (missing integrity flag).'
+                }
+
+            # ── 2. Extract LSBs (excluding flag zone) ────────────────────
+            flag_pixel_start = (height * width) - 8
             all_bits = []
-            
+            pixel_counter = 0
+
             for y in range(height):
                 for x in range(width):
+                    if pixel_counter >= flag_pixel_start:
+                        break
                     for c in range(channels):
-                        # Extract only the LSB (1 bit per channel)
-                        pixel_val = int(img_array[y, x, c])
-                        bit = pixel_val & 1
-                        all_bits.append(bit)
-            
-            print(f"Extracted {len(all_bits)} bits total")
-            
-            # Check if we have enough bits for at least the length header
+                        all_bits.append(int(img_array[y, x, c]) & 1)
+                    pixel_counter += 1
+                if pixel_counter >= flag_pixel_start:
+                    break
+
+            print(f"Extracted {len(all_bits)} bits")
+
             if len(all_bits) < 32:
-                return {
-                    'success': False,
-                    'error': 'Image too small to contain hidden data'
-                }
-            
-            # Convert first 32 bits to 4 bytes (length header)
-            length_bytes = self._bits_to_bytes(all_bits[:32])
-            
-            # Unpack the length
+                return {'success': False, 'error': 'Image too small to contain hidden data'}
+
+            # ── 3. Parse length header ───────────────────────────────────
+            length_bytes   = self._bits_to_bytes(all_bits[:32])
             payload_length = struct.unpack('>I', length_bytes)[0]
-            
-            print(f"Payload length from header: {payload_length} bytes")
-            
-            # Validate payload length
-            max_possible_bytes = (len(all_bits) - 32) // 8
-            
+            print(f"Payload length: {payload_length} bytes")
+
+            max_possible = (len(all_bits) - 32) // 8
             if payload_length <= 0:
+                return {'success': False, 'error': 'No hidden data found (invalid length)'}
+            if payload_length > max_possible:
                 return {
                     'success': False,
-                    'error': 'No hidden data found (invalid length)'
+                    'error':   f'Image doesn\'t contain enough data ({payload_length} needed, {max_possible} available)'
                 }
-            
-            if payload_length > max_possible_bytes:
-                return {
-                    'success': False,
-                    'error': f'Image doesn\'t contain enough data. Expected {payload_length} bytes but only {max_possible_bytes} available'
-                }
-            
-            # Calculate total bits needed
-            total_bits_needed = 32 + (payload_length * 8)
-            
-            # Check if we have enough bits
+
+            total_bits_needed = 32 + payload_length * 8
             if total_bits_needed > len(all_bits):
-                return {
-                    'success': False,
-                    'error': 'Corrupted data: not enough bits in image'
-                }
-            
-            # Extract the exact number of bits needed for the payload
-            payload_bits = all_bits[32:total_bits_needed]
-            
-            # Convert bits to bytes
-            payload = self._bits_to_bytes(payload_bits)
-            
+                return {'success': False, 'error': 'Corrupted data: not enough bits'}
+
+            payload = self._bits_to_bytes(all_bits[32:total_bits_needed])
             print(f"Payload extracted: {len(payload)} bytes")
-            
-            # Now parse the payload structure
+
+            # ── 4. Parse magic ───────────────────────────────────────────
             pos = 0
-            
-            # Check for magic number (4 bytes)
             if len(payload) < 4:
-                return {
-                    'success': False,
-                    'error': 'Payload too small for magic number'
-                }
-            
-            magic = payload[pos:pos+4]
-            print(f"Magic number: {magic}")
-            
+                return {'success': False, 'error': 'Payload too small for magic number'}
+
+            magic = payload[pos:pos + 4]
             if magic != b'STEG':
                 return {
                     'success': False,
-                    'error': 'No steganographic data found. This image may not contain hidden data or was encoded with a different tool.'
+                    'error':   'No steganographic data found (wrong magic number).'
                 }
             pos += 4
-            
-            # Get metadata length (4 bytes)
+
+            # ── 5. Parse metadata ────────────────────────────────────────
             if pos + 4 > len(payload):
-                return {
-                    'success': False,
-                    'error': 'Corrupted data: cannot read metadata length'
-                }
-            
-            metadata_length = struct.unpack('>I', payload[pos:pos+4])[0]
+                return {'success': False, 'error': 'Corrupted: cannot read metadata length'}
+
+            metadata_length = struct.unpack('>I', payload[pos:pos + 4])[0]
             pos += 4
-            
-            print(f"Metadata length: {metadata_length} bytes")
-            
-            # Validate metadata length
+
             if metadata_length < 12 or metadata_length > len(payload) - pos:
-                return {
-                    'success': False,
-                    'error': f'Invalid metadata length: {metadata_length}'
-                }
-            
-            # Parse metadata section
-            metadata_section = payload[pos:pos+metadata_length]
-            meta_pos = 0
-            
-            # Extract salt
-            if meta_pos + 4 > len(metadata_section):
-                return {
-                    'success': False,
-                    'error': 'Corrupted metadata: cannot read salt length'
-                }
-            
-            salt_length = struct.unpack('>I', metadata_section[meta_pos:meta_pos+4])[0]
-            meta_pos += 4
-            
-            # Validate salt length
-            if salt_length < 8 or salt_length > 256:
-                return {
-                    'success': False,
-                    'error': f'Invalid salt length: {salt_length}'
-                }
-            
-            if meta_pos + salt_length > len(metadata_section):
-                return {
-                    'success': False,
-                    'error': 'Corrupted metadata: salt extends beyond section'
-                }
-            
-            salt = metadata_section[meta_pos:meta_pos+salt_length]
-            meta_pos += salt_length
-            
-            # Extract IV
-            if meta_pos + 4 > len(metadata_section):
-                return {
-                    'success': False,
-                    'error': 'Corrupted metadata: cannot read IV length'
-                }
-            
-            iv_length = struct.unpack('>I', metadata_section[meta_pos:meta_pos+4])[0]
-            meta_pos += 4
-            
-            # Validate IV length
-            if iv_length < 8 or iv_length > 256:
-                return {
-                    'success': False,
-                    'error': f'Invalid IV length: {iv_length}'
-                }
-            
-            if meta_pos + iv_length > len(metadata_section):
-                return {
-                    'success': False,
-                    'error': 'Corrupted metadata: IV extends beyond section'
-                }
-            
-            iv = metadata_section[meta_pos:meta_pos+iv_length]
-            meta_pos += iv_length
-            
-            # Extract tag
-            if meta_pos + 4 > len(metadata_section):
-                return {
-                    'success': False,
-                    'error': 'Corrupted metadata: cannot read tag length'
-                }
-            
-            tag_length = struct.unpack('>I', metadata_section[meta_pos:meta_pos+4])[0]
-            meta_pos += 4
-            
-            # Validate tag length
-            if tag_length < 8 or tag_length > 256:
-                return {
-                    'success': False,
-                    'error': f'Invalid tag length: {tag_length}'
-                }
-            
-            if meta_pos + tag_length > len(metadata_section):
-                return {
-                    'success': False,
-                    'error': 'Corrupted metadata: tag extends beyond section'
-                }
-            
-            tag = metadata_section[meta_pos:meta_pos+tag_length]
-            
-            pos += metadata_length
-            
-            # Get encrypted data length
-            if pos + 4 > len(payload):
-                return {
-                    'success': False,
-                    'error': 'Corrupted data: cannot read data length'
-                }
-            
-            data_length = struct.unpack('>I', payload[pos:pos+4])[0]
-            pos += 4
-            
-            # Validate data length
-            if data_length <= 0 or pos + data_length > len(payload):
-                return {
-                    'success': False,
-                    'error': f'Invalid data length: {data_length}'
-                }
-            
-            encrypted_data = payload[pos:pos+data_length]
-            
-            print(f"Encrypted data: {len(encrypted_data)} bytes")
-            print(f"Salt: {len(salt)} bytes, IV: {len(iv)} bytes, Tag: {len(tag)} bytes")
-            
-            # Decrypt message
+                return {'success': False, 'error': f'Invalid metadata length: {metadata_length}'}
+
+            meta = payload[pos:pos + metadata_length]
+            mp   = 0
+
+            def read_field(section, offset, name):
+                if offset + 4 > len(section):
+                    raise ValueError(f'Corrupted metadata: cannot read {name} length')
+                flen = struct.unpack('>I', section[offset:offset + 4])[0]
+                offset += 4
+                if flen < 8 or flen > 256:
+                    raise ValueError(f'Invalid {name} length: {flen}')
+                if offset + flen > len(section):
+                    raise ValueError(f'Corrupted metadata: {name} extends beyond section')
+                return section[offset:offset + flen], offset + flen
+
             try:
-                decrypted_message = self.security.decrypt_message(
+                salt, mp = read_field(meta, mp, 'salt')
+                iv,   mp = read_field(meta, mp, 'IV')
+                tag,  mp = read_field(meta, mp, 'tag')
+            except ValueError as ve:
+                return {'success': False, 'error': str(ve)}
+
+            pos += metadata_length
+
+            if pos + 4 > len(payload):
+                return {'success': False, 'error': 'Corrupted: cannot read data length'}
+
+            data_length = struct.unpack('>I', payload[pos:pos + 4])[0]
+            pos += 4
+
+            if data_length <= 0 or pos + data_length > len(payload):
+                return {'success': False, 'error': f'Invalid data length: {data_length}'}
+
+            encrypted_data = payload[pos:pos + data_length]
+            print(f"Encrypted data: {len(encrypted_data)} bytes | Salt: {len(salt)} | IV: {len(iv)} | Tag: {len(tag)}")
+
+            # ── 6. Decrypt ───────────────────────────────────────────────
+            try:
+                decrypted = self.security.decrypt_message(
                     encrypted_data, salt, iv, tag, password
                 )
-                print(f"Decrypted message: {len(decrypted_message)} bytes")
+                print(f"Decrypted: {len(decrypted)} bytes")
+
             except Exception as e:
+                # ── WRONG PASSWORD → self-destruct ───────────────────────
+                print(f"Decryption failed ({e}). Triggering self-destruct.")
+                self._destroy_payload(image_path, img_array)
+
                 return {
                     'success': False,
-                    'error': f'Decryption failed. Wrong password or corrupted data: {str(e)}'
+                    'destroyed': True,
+                    'error': (
+                        '🔥 WRONG PASSWORD — SELF-DESTRUCT ACTIVATED\n'
+                        'The hidden message has been permanently erased from the image. '
+                        'No further attempts are possible.'
+                    )
                 }
-            
-            # Try to parse as JSON (for metadata support)
+
+            # ── 7. Decode text ───────────────────────────────────────────
             import json
             try:
-                message_str = decrypted_message.decode('utf-8')
-                print(f"Decoded string: {message_str[:50]}...")
-                
-                message_json = json.loads(message_str)
+                msg_str  = decrypted.decode('utf-8')
+                msg_json = json.loads(msg_str)
                 return {
-                    'success': True,
-                    'metadata': message_json.get('metadata', {}),
-                    'message': message_json.get('content', ''),
-                    'raw_message': message_str
+                    'success':     True,
+                    'metadata':    msg_json.get('metadata', {}),
+                    'message':     msg_json.get('content', ''),
+                    'raw_message': msg_str
                 }
             except (json.JSONDecodeError, UnicodeDecodeError):
-                # Not JSON, just return as plain text
                 try:
-                    message_str = decrypted_message.decode('utf-8')
-                    return {
-                        'success': True,
-                        'metadata': {},
-                        'message': message_str,
-                        'raw_message': message_str
-                    }
-                except:
-                    return {
-                        'success': False,
-                        'error': 'Failed to decode message as text'
-                    }
-                
+                    msg_str = decrypted.decode('utf-8')
+                    return {'success': True, 'metadata': {}, 'message': msg_str, 'raw_message': msg_str}
+                except Exception:
+                    return {'success': False, 'error': 'Failed to decode message as text'}
+
         except Exception as e:
             import traceback
             traceback.print_exc()
-            return {
-                'success': False,
-                'error': f'Decoding error: {str(e)}'
-            }
-    
+            return {'success': False, 'error': f'Decoding error: {str(e)}'}
+
+    # ------------------------------------------------------------------ #
+    #  Helpers                                                             #
+    # ------------------------------------------------------------------ #
+
     def _bits_to_bytes(self, bits: list) -> bytes:
-        """
-        Convert list of bits to bytes
-        """
         if len(bits) % 8 != 0:
-            # Pad with zeros if not multiple of 8
-            bits = bits + [0] * (8 - (len(bits) % 8))
-        
-        bytes_data = bytearray()
+            bits = bits + [0] * (8 - len(bits) % 8)
+        result = bytearray()
         for i in range(0, len(bits), 8):
             byte = 0
             for j in range(8):
-                if i + j < len(bits):
-                    byte = (byte << 1) | (bits[i + j] & 1)
-                else:
-                    byte = (byte << 1)  # Pad with 0
-            bytes_data.append(byte)
-        
-        return bytes(bytes_data)
-    
-    def detect_hidden_data(self, image_path: str) -> bool:
+                byte = (byte << 1) | (bits[i + j] & 1)
+            result.append(byte)
+        return bytes(result)
+
+    def detect_hidden_data(self, image_path: str) -> dict:
         """
-        Detect if image contains hidden data (steganalysis)
+        Detect if image contains hidden data and report its status.
+        Returns dict with 'found' (bool), 'poisoned' (bool), 'message' (str).
         """
         try:
             img = Image.open(image_path)
@@ -330,42 +305,50 @@ class SteganographyDecoder:
                 img = img.convert('RGB')
             if img.mode == 'RGBA':
                 img = img.convert('RGB')
-            
+
             img_array = np.array(img, dtype=np.uint8)
             height, width, channels = img_array.shape
-            
-            # Extract first 64 bits
+
+            flag = self._read_flag(img_array)
+
+            if flag == FLAG_POISONED:
+                return {
+                    'found':    True,
+                    'poisoned': True,
+                    'message':  '💀 Image contains destroyed steganographic data (self-destruct was triggered).'
+                }
+
+            if flag != FLAG_ALIVE:
+                return {
+                    'found':    False,
+                    'poisoned': False,
+                    'message':  'No steganographic data detected.'
+                }
+
+            # Also verify magic number
             bits = []
             count = 0
-            for y in range(min(height, 3)):
-                for x in range(min(width, 30)):
+            for y in range(height):
+                for x in range(width):
                     for c in range(channels):
                         if count < 64:
-                            pixel_val = int(img_array[y, x, c])
-                            bits.append(pixel_val & 1)
+                            bits.append(int(img_array[y, x, c]) & 1)
                             count += 1
-                        else:
-                            break
-                    if count >= 64:
-                        break
-                if count >= 64:
-                    break
-            
+
             if len(bits) >= 64:
-                # Convert first 32 bits to get length
-                length_bytes = self._bits_to_bytes(bits[:32])
-                length = struct.unpack('>I', length_bytes)[0]
-                
-                # Check if length is reasonable
-                max_bytes = (height * width * channels) // 8
-                if 4 < length < max_bytes:
-                    # Convert next 32 bits to check magic number
-                    magic_bytes = self._bits_to_bytes(bits[32:64])
-                    if magic_bytes == b'STEG':
-                        return True
-            
-            return False
-            
+                magic = self._bits_to_bytes(bits[32:64])
+                if magic == b'STEG':
+                    return {
+                        'found':    True,
+                        'poisoned': False,
+                        'message':  '✅ Active steganographic data found. Data is intact and protected.'
+                    }
+
+            return {
+                'found':    False,
+                'poisoned': False,
+                'message':  'No steganographic data detected.'
+            }
+
         except Exception as e:
-            print(f"Detection error: {e}")
-            return False
+            return {'found': False, 'poisoned': False, 'message': f'Detection error: {e}'}
